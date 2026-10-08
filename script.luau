@@ -3,6 +3,8 @@ if not getgenv().Library then
 -- made by samet (joestar._3 on discord)
 -- https://discord.gg/VhvTd5HV8d
 
+print("start")
+
 if getgenv().Library then
     getgenv().Library:Unload()
 end
@@ -4018,10 +4020,10 @@ local S = {
 	tracerColor = Color3.fromRGB(255, 255, 255),
 	tracerThickness = 0.15,
 	tracerLifetime = 1.5,
-    manip = false,           -- enable origin-swap manipulation
-    manipKeyHeld = false,    -- set by keybind
-    manipDist = 4.5,         -- how far the short rays go
-    manipAutoFire = true,    -- auto fire when clear LOS is found
+    manip = false,
+    manipKeyHeld = false,
+    manipDist = 4.5,
+    manipAutoFire = true,
 	hitmarker = false,
 	hitmarkerColor = Color3.fromRGB(255, 255, 255),
 	hitmarkerSize = 32,
@@ -5764,16 +5766,23 @@ W:SetAttribute("__op1_saShots", (W:GetAttribute("__op1_saShots") or 0) + 1)
 		W:SetAttribute("__op1_saLastHit", best ~= nil)
         if best then
             local cf: any = D.getstack(2, 3)
-            if typeof(cf) == "CFrame" then
-                local manipO = W:GetAttribute("__op1_manipOrigin")
-                local manipT = W:GetAttribute("__op1_manipT")
-                local useManip = typeof(manipO) == "Vector3" and type(manipT) == "number" and (os.clock() - manipT) < 0.15
+            local manipO = W:GetAttribute("__op1_manipOrigin")
+            local manipT = W:GetAttribute("__op1_manipT")
+            local useManip = typeof(manipO) == "Vector3"
+                and type(manipT) == "number"
+                and (os.clock() - manipT) < 0.15
 
-                if useManip then
+            if useManip then
+                -- force look from the PROBE origin to the target
+                if typeof(cf) == "CFrame" then
                     D.setstack(2, 5, CFrame.lookAt(manipO, best))
-                else
-                    D.setstack(2, 5, CFrame.lookAt(cf.Position, best))
                 end
+                -- return the probe as the validated origin (do NOT clamp back to muzzle)
+                return manipO
+            end
+
+            if typeof(cf) == "CFrame" then
+                D.setstack(2, 5, CFrame.lookAt(cf.Position, best))
             end
         end
         return R.validate_position(o, t, r)
@@ -6590,84 +6599,163 @@ RunService:BindToRenderStep("OP1_ThirdPerson", Enum.RenderPriority.Camera.Value 
 track({ Disconnect = function() pcall(tpRestore); pcall(function() RunService:UnbindFromRenderStep("OP1_ThirdPerson") end) end })
 
 -- ===========================================================================
--- FEATURE: Origin Manipulation (smooth, no teleport, no viewmodel move)
--- Temporarily forces the shoot origin to a position that has clear LOS
+-- FEATURE: Origin Manipulation via muzzle spoof
+-- Probe around camera → if a point can see the target, move the real
+-- Shoot/Shot origin there for one frame, fire, then restore.
 -- ===========================================================================
 
-local manipOrigin = nil
-local manipTargetPos = nil
 local lastManipFire = 0
+local spoofSaved = nil -- { inst = Instance, cf = CFrame } or for Attachment: { inst, relative }
 
-local function getManipOrigin(targetPos)
-	local cam = WS.CurrentCamera
-	if not cam or not targetPos then return nil end
+local function getMuzzleInst()
+	local vms = WS:FindFirstChild("Viewmodels")
+	local lvm = vms and vms:FindFirstChild("LocalViewmodel")
+	if not lvm then return nil end
 
-	local camPos = cam.CFrame.Position
-	local dir = (targetPos - camPos)
-	if dir.Magnitude < 1 then return nil end
-	dir = dir.Unit
+	-- Prefer the actual Shot part (matches gun.luau a1.shot)
+	local shot = lvm:FindFirstChild("Shot", true)
+	if shot and shot:IsA("BasePart") then
+		return shot
+	end
 
-	local ignore = getIgnore()
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = ignore
-
-	local offsets = {
-		dir,
-		(dir + cam.CFrame.RightVector * 0.35).Unit,
-		(dir - cam.CFrame.RightVector * 0.35).Unit,
-		(dir + cam.CFrame.RightVector * 0.7).Unit,
-		(dir - cam.CFrame.RightVector * 0.7).Unit,
-	}
-
-	for _, testDir in ipairs(offsets) do
-		local origin = camPos + testDir * 0.25
-		local result = WS:Raycast(origin, testDir * S.manipDist, params)
-
-		if not result then
-			return origin + testDir * (S.manipDist * 0.55)
-		end
-
-		local past = result.Position + testDir * 0.12
-		local check = WS:Raycast(past, (targetPos - past), params)
-		if not check or (check.Position - targetPos).Magnitude < 2.8 then
-			return past
-		end
+	-- Fallback: Shoot attachment's parent part
+	local shoot = lvm:FindFirstChild("Shoot", true)
+	if shoot and shoot:IsA("Attachment") then
+		return shoot.Parent -- usually Root / Barrel root
 	end
 
 	return nil
 end
 
+local function canSeeFrom(fromPos, targetPos, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local delta = targetPos - fromPos
+	if delta.Magnitude < 0.5 then return true end
+
+	local hit = WS:Raycast(fromPos, delta, params)
+	if not hit then return true end
+	return (hit.Position - targetPos).Magnitude < 2.5
+end
+
+local function findClearOrigin(targetPos)
+	local cam = WS.CurrentCamera
+	if not cam then return nil end
+
+	local camPos = cam.CFrame.Position
+	local ignore = getIgnore()
+	local dist = math.clamp(S.manipDist or 3, 1, 5) -- keep short; validate is strict
+
+	if canSeeFrom(camPos, targetPos, ignore) then
+		return nil -- already visible, no spoof needed
+	end
+
+	local cf = cam.CFrame
+	local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
+	local dirs = {
+		r, -r, l,
+		(r + l).Unit, (-r + l).Unit,
+		(r + u * 0.3).Unit, (-r + u * 0.3).Unit,
+		(l + u * 0.25).Unit,
+	}
+
+	local wallParams = RaycastParams.new()
+	wallParams.FilterType = Enum.RaycastFilterType.Exclude
+	wallParams.FilterDescendantsInstances = ignore
+
+	for _, dir in ipairs(dirs) do
+		for step = 0.35, dist, 0.35 do
+			local wall = WS:Raycast(camPos, dir * step, wallParams)
+			if wall and wall.Distance < step - 0.05 then
+				break
+			end
+			local probe = camPos + dir * step
+			if canSeeFrom(probe, targetPos, ignore) then
+				return probe
+			end
+		end
+	end
+	return nil
+end
+
+local function restoreMuzzle()
+	if not spoofSaved then return end
+	local inst = spoofSaved.inst
+	if inst and inst.Parent then
+		pcall(function()
+			if inst:IsA("BasePart") then
+				inst.CFrame = spoofSaved.cf
+			end
+		end)
+	end
+	spoofSaved = nil
+end
+
+local function spoofMuzzleTo(origin, targetPos)
+	restoreMuzzle()
+
+	local muzzle = getMuzzleInst()
+	if not muzzle or not muzzle:IsA("BasePart") then
+		return false
+	end
+
+	spoofSaved = { inst = muzzle, cf = muzzle.CFrame }
+
+	-- move origin only; keep it looking at the target
+	pcall(function()
+		muzzle.CFrame = CFrame.lookAt(origin, targetPos)
+	end)
+	return true
+end
+
 track(RunService.RenderStepped:Connect(function()
-	manipOrigin = nil
-	manipTargetPos = nil
+	-- always restore previous frame's spoof first
+	restoreMuzzle()
+
+	WS:SetAttribute("__op1_manipOrigin", nil)
+	WS:SetAttribute("__op1_manipT", 0)
 
 	if not S.manip or not S.manipKeyHeld then return end
 
-	local targets = getTargets()
-	if #targets == 0 then return end
+	local cam = WS.CurrentCamera
+	if not cam then return end
 
-	local best = targets[1]
-	local aimPos = best.aim and best.aim.Position or (best.e and best.e.head and best.e.head.Position)
-	if not aimPos then return end
+	-- nearest on-screen enemy (ignore visible check)
+	local bestPos, bestDist = nil, math.huge
+	for _, e in ipairs(getEnemies()) do
+		local aim = aimPartOf(e)
+		if aim then
+			local sp = cam:WorldToViewportPoint(aim.Position)
+			if sp.Z > 0 then
+				local d = (Vector2.new(sp.X, sp.Y) - cam.ViewportSize * 0.5).Magnitude
+				if d < bestDist then
+					bestDist = d
+					bestPos = aim.Position
+				end
+			end
+		end
+	end
+	if not bestPos then return end
 
-	local origin = getManipOrigin(aimPos)
-	if not origin then return end
+	local clearOrigin = findClearOrigin(bestPos)
+	if not clearOrigin then return end
 
-	manipOrigin = origin
-	manipTargetPos = aimPos
+	-- spoof muzzle to the clear point THIS FRAME
+	if not spoofMuzzleTo(clearOrigin, bestPos) then return end
 
-	-- Publish to the silent aim actor so it can force the origin
-	WS:SetAttribute("__op1_manipOrigin", origin)
-	WS:SetAttribute("__op1_manipTarget", aimPos)
+	WS:SetAttribute("__op1_manipOrigin", clearOrigin)
 	WS:SetAttribute("__op1_manipT", os.clock())
+	WS:SetAttribute("__op1_saAimAt", bestPos)
+	WS:SetAttribute("__op1_saAimAtT", os.clock())
 
 	if S.manipAutoFire and (not Window or not Window.IsOpen) then
 		local now = os.clock()
-		if now - lastManipFire > 0.06 then
+		if now - lastManipFire > 0.08 then
 			lastManipFire = now
 			pcall(function() mouse1press() end)
-			task.delay(0.02, function()
+			task.delay(0.025, function()
 				pcall(function() mouse1release() end)
 			end)
 		end
