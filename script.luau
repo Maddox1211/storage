@@ -4018,13 +4018,10 @@ local S = {
 	tracerColor = Color3.fromRGB(255, 255, 255),
 	tracerThickness = 0.15,
 	tracerLifetime = 1.5,
-	peekbot = false,
-	peekStuds = 3,
-	peekHeld = false,
-	peekAutoFire = true,
-	peekMs = 50,
-	peekSide = "Auto", -- Auto | Left | Right | Forward
-	peekLean = false, -- visual camera offset only; shots do not need the body to move
+    manip = false,           -- enable origin-swap manipulation
+    manipKeyHeld = false,    -- set by keybind
+    manipDist = 4.5,         -- how far the short rays go
+    manipAutoFire = true,    -- auto fire when clear LOS is found
 	hitmarker = false,
 	hitmarkerColor = Color3.fromRGB(255, 255, 255),
 	hitmarkerSize = 32,
@@ -4170,15 +4167,6 @@ local silentAimUninstall = nil
 local silentAimInstalled = false
 local cleanupDraw = nil
 
--- Peekbot state (must be before cleanup for peekReset call)
-local peekState, peekSavedCF, peekSavedCam, peekDelta, peekTimer, peekAim = "idle", nil, nil, nil, 0, nil
-local function peekReset()
-	if LP.Character then
-		local r = LP.Character:FindFirstChild("HumanoidRootPart")
-		if r then pcall(function() r.CFrame = peekSavedCF or r.CFrame; r.Anchored = false end) end
-	end
-	peekState = "idle"; peekSavedCF = nil; peekSavedCam = nil; peekDelta = nil; peekTimer = 0; peekAim = nil
-end
 
 local function cleanup()
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
@@ -4204,7 +4192,6 @@ local function cleanup()
     S.flyEnabled = false
     S.noclipEnabled = false
 	-- Reset peekbot state
-	peekReset()
 	for _, name in ipairs({ "OP1_EnemyPanel", "OP1_FOV", "OP1_Skeleton", "OP1_Boxes", "OP1_Devices", "OP1_Hitmarker" }) do
 		pcall(function()
 			local cg = game:GetService("CoreGui")
@@ -4242,9 +4229,8 @@ local function pushSettings()
 	WS:SetAttribute("__op1_saTeam", S.teamCheck)
 	WS:SetAttribute("__op1_saPriority", S.priority)
 	WS:SetAttribute("__op1_saMaxAngle", S.maxAngle)
-	WS:SetAttribute("__op1_manipStuds", math.clamp(S.peekStuds, 0.1, 3))
-	WS:SetAttribute("__op1_manipSide", S.peekSide)
-	WS:SetAttribute("__op1_manipOn", S.peekbot == true and S.peekHeld == true)
+    WS:SetAttribute("__op1_manipOn", S.manip == true and S.manipKeyHeld == true)
+    WS:SetAttribute("__op1_manipDist", S.manipDist or 4.5)
 	-- ragebot settings
 	WS:SetAttribute("__op1_rbEnabled", S.rbEnabled)
 	WS:SetAttribute("__op1_rbAutoShoot", S.rbAutoShoot)
@@ -5000,103 +4986,137 @@ end))
 
 
 -- ===========================================================================
--- FEATURE: Bullet Tracers (customizable)
+-- FEATURE: Bullet Tracers (white, 1s lifespan)
 -- ===========================================================================
-local tracerParts = {}
-local tracerLines = {}
-local function createTracer()
-	local beam = Instance.new("Beam")
-	beam.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
-	beam.FaceCamera = true
-	beam.Width0 = 0.15
-	beam.Width1 = 0.15
-	beam.LightEmission = 1
-	beam.LightInfluence = 0
-	beam.TextureSpeed = 0
-	beam.TextureLength = 0
-	beam.FaceCamera = true
-	beam.Transparency = NumberSequence.new(0)
-	return beam
+
+local tracerFiring = false
+local tracerLastShot = 0
+local TRACER_FIRE_RATE = 0.1
+local TRACER_DOWN_OFFSET = 0.15
+
+local function getShotPosition()
+	local viewmodels = WS:FindFirstChild("Viewmodels")
+	local viewmodel = viewmodels and viewmodels:FindFirstChild("LocalViewmodel")
+	if not viewmodel then return nil end
+
+	local shoot = viewmodel:FindFirstChild("Shoot", true)
+	if shoot and shoot:IsA("Attachment") then
+		return shoot.WorldPosition - Vector3.new(0, TRACER_DOWN_OFFSET, 0)
+	end
+	return nil
 end
-local function createAttachment(parent, pos)
-	local a = Instance.new("Attachment")
-	a.Position = pos
-	a.Parent = parent
-	return a
-end
-local activeTracers = {}
-local function addTracer(origin, target)
+
+local function createTracer(origin, target)
 	if not S.bulletTracers then return end
-	local beam = createTracer()
-	local a0 = createAttachment(workspace.Terrain, origin)
-	local a1 = createAttachment(workspace.Terrain, target)
+	if not origin or not target then return end
+
+	local a0 = Instance.new("Attachment")
+	a0.WorldPosition = origin
+	a0.Parent = workspace.Terrain
+
+	local a1 = Instance.new("Attachment")
+	a1.WorldPosition = target
+	a1.Parent = workspace.Terrain
+
+	local beam = Instance.new("Beam")
 	beam.Attachment0 = a0
 	beam.Attachment1 = a1
-	beam.Color = ColorSequence.new(S.tracerColor)
-	beam.Width0 = S.tracerThickness
-	beam.Width1 = S.tracerThickness
-	beam.Parent = a0
-	table.insert(activeTracers, {beam = beam, a0 = a0, a1 = a1, created = os.clock()})
-	task.delay(S.tracerLifetime, function()
-		for i, t in ipairs(activeTracers) do
-			if t.beam == beam then
-				table.remove(activeTracers, i)
-				break
-			end
-		end
+	beam.FaceCamera = true
+	beam.Color = ColorSequence.new(S.tracerColor or Color3.new(1, 1, 1))
+	beam.Width0 = S.tracerThickness or 0.13
+	beam.Width1 = (S.tracerThickness or 0.13) * 0.3
+	beam.LightEmission = 1
+	beam.LightInfluence = 0
+	beam.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.6, 0.25),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	beam.Parent = workspace.Terrain
+
+	task.delay(S.tracerLifetime or 1, function()
 		pcall(function() beam:Destroy() end)
 		pcall(function() a0:Destroy() end)
 		pcall(function() a1:Destroy() end)
 	end)
 end
 
--- Hook gun fire to create tracers
-local lastGunPos = nil
-local lastFireTime = 0
-track(RunService.RenderStepped:Connect(function()
-	if not S.bulletTracers then return end
-	local ch = LP.Character
-	local item = ch and ch:FindFirstChild("Character") and ch.Character:FindFirstChild("equipped") and ch.Character.equipped.Value
-	local gun = item and item:FindFirstChild("Gun")
-	if gun then
-		local muzzle = gun:FindFirstChild("Muzzle") or gun:FindFirstChild("muzzle") or gun:FindFirstChild("Barrel") or gun:FindFirstChild("barrel")
-		if muzzle and muzzle:IsA("BasePart") then
-			local pos = muzzle.Position
-			-- Detect fire by checking gun's fire state or ragebot auto-fire
-			local fireState = gun:FindFirstChild("fire") or gun:FindFirstChild("Fire") or gun:FindFirstChild("firing")
-			local isFiring = false
-			if fireState and fireState:IsA("BoolValue") then
-				isFiring = fireState.Value
-			elseif fireState and fireState:IsA("NumberValue") then
-				isFiring = fireState.Value > 0
-			elseif S.rbEnabled and S.rbAutoShoot and tick() - lastFireTime < 0.1 then
-				-- Ragebot auto-fire detection
-				isFiring = true
-				lastFireTime = tick()
-			else
-				-- Fallback: detect by muzzle position change (recoil)
-				if lastGunPos and (pos - lastGunPos).Magnitude > 0.1 then
-					isFiring = true
-				end
-			end
-			
-			if isFiring then
-				local targets = getTargets()
-				if #targets > 0 then
-					local aimPt = targets[1].aim or targets[1].e.head
-					addTracer(lastGunPos, aimPt.Position)
-				else
-					local cam = WS.CurrentCamera
-					if cam then
-						addTracer(lastGunPos, lastGunPos + cam.CFrame.LookVector * 500)
-					end
-				end
-			end
-			lastGunPos = pos
+local function fireTracer()
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+
+	-- Start slightly below the real Shoot attachment
+	local origin = getShotPosition()
+	if not origin then return end
+
+	local target
+
+	-- 1. Prefer silent aim / ragebot target if active
+	local aimAt = workspace:GetAttribute("__op1_saAimAt")
+	local aimT = workspace:GetAttribute("__op1_saAimAtT")
+	if typeof(aimAt) == "Vector3" and type(aimT) == "number" and (os.clock() - aimT) < 0.2 then
+		target = aimAt
+	else
+		-- 2. Raycast from the CAMERA (true aim), not from the lowered origin
+		local camPos = camera.CFrame.Position
+		local direction = camera.CFrame.LookVector * 500
+
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {
+			player.Character,
+			workspace:FindFirstChild("Viewmodels")
+		}
+
+		local result = workspace:Raycast(camPos, direction, params)
+
+		if result then
+			target = result.Position
+		else
+			target = camPos + direction
 		end
+	end
+
+	createTracer(origin, target)
+end
+
+-- Hold-to-fire detection
+track(UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		tracerFiring = true
 	end
 end))
 
+track(UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		tracerFiring = false
+	end
+end))
+
+track(RunService.RenderStepped:Connect(function()
+	if not S.bulletTracers then return end
+
+	-- Manual hold fire
+	if tracerFiring then
+		local now = os.clock()
+		if now - tracerLastShot >= TRACER_FIRE_RATE then
+			tracerLastShot = now
+			fireTracer()
+		end
+		return
+	end
+
+	-- Also catch ragebot / auto-fire (they use mouse1press)
+	local aimT = WS:GetAttribute("__op1_saAimAtT")
+	if type(aimT) == "number" and (os.clock() - aimT) < 0.08 then
+		local now = os.clock()
+		if now - tracerLastShot >= TRACER_FIRE_RATE then
+			tracerLastShot = now
+			fireTracer()
+		end
+	end
+end))
 
 -- ===========================================================================
 -- FEATURE: Drawing-based player ESP (fixed – uses real character models)
@@ -5744,7 +5764,17 @@ W:SetAttribute("__op1_saShots", (W:GetAttribute("__op1_saShots") or 0) + 1)
 		W:SetAttribute("__op1_saLastHit", best ~= nil)
         if best then
             local cf: any = D.getstack(2, 3)
-            if typeof(cf) == "CFrame" then D.setstack(2, 5, CFrame.lookAt(cf.Position, best)) end
+            if typeof(cf) == "CFrame" then
+                local manipO = W:GetAttribute("__op1_manipOrigin")
+                local manipT = W:GetAttribute("__op1_manipT")
+                local useManip = typeof(manipO) == "Vector3" and type(manipT) == "number" and (os.clock() - manipT) < 0.15
+
+                if useManip then
+                    D.setstack(2, 5, CFrame.lookAt(manipO, best))
+                else
+                    D.setstack(2, 5, CFrame.lookAt(cf.Position, best))
+                end
+            end
         end
         return R.validate_position(o, t, r)
     end or R[k] end
@@ -6371,15 +6401,37 @@ rbSec:Dropdown({ Name = "Target Part", Flag = "op1_rbTargetPart", Items = { "Aut
 	rbSec:Toggle({ Name = "Auto Stop", Flag = "op1_rbAutoStop", Default = false, Callback = function(v) S.rbAutoStop = v; pushSettings() end })
 rbSec:Toggle({ Name = "Auto Crouch", Flag = "op1_rbAutoCrouch", Default = false, Callback = function(v) S.rbAutoCrouch = v; pushSettings() end })
 
--- Peekbot (moved to Ragebot)
-rbSec:Label("--- Peekbot ---")
-rbSec:Toggle({ Name = "Peekbot", Flag = "op1_peekbot", Default = false, Callback = function(v) S.peekbot = v end })
-rbSec:Label("Peek Key (hold)"):Keybind({ Flag = "op1_peekKey", Default = Enum.KeyCode.Q, Mode = "Hold", Callback = function(toggled) S.peekHeld = toggled; if not toggled then local ch = LP.Character; local r = ch and ch:FindFirstChild("HumanoidRootPart"); if r then r.Anchored = false end end end })
-rbSec:Slider({ Name = "Peek Studs", Flag = "op1_peekStuds", Min = 2, Max = 30, Default = 6, Suffix = "st", Decimals = 1, Callback = function(v) S.peekStuds = v end })
-rbSec:Slider({ Name = "Peek Hold (ms)", Flag = "op1_peekMs", Min = 5, Max = 400, Default = 50, Suffix = "ms", Decimals = 1, Callback = function(v) S.peekMs = v end })
-rbSec:Toggle({ Name = "Auto-Fire During Peek", Flag = "op1_peekAutoFire", Default = true, Callback = function(v) S.peekAutoFire = v end })
-rbSec:Dropdown({ Name = "Peek Side", Flag = "op1_peekSide", Items = { "Auto", "Left", "Right", "Forward", "Backward" }, Default = "Auto", Callback = function(v) S.peekSide = v; pushSettings() end })
-rbSec:Toggle({ Name = "Peek Lean", Flag = "op1_peekLean", Default = false, Callback = function(v) S.peekLean = v end })
+rbSec:Label("--- Manipulation ---")
+rbSec:Toggle({
+	Name = "Origin Manipulation",
+	Flag = "op1_manip",
+	Default = false,
+	Callback = function(v) S.manip = v end
+})
+rbSec:Label("Manip Key (hold)"):Keybind({
+	Flag = "op1_manipKey",
+	Default = Enum.KeyCode.LeftControl,
+	Mode = "Hold",
+	Callback = function(toggled)
+		S.manipKeyHeld = toggled
+	end
+})
+rbSec:Slider({
+	Name = "Manip Distance",
+	Flag = "op1_manipDist",
+	Min = 2,
+	Max = 8,
+	Default = 4.5,
+	Suffix = "st",
+	Decimals = 1,
+	Callback = function(v) S.manipDist = v end
+})
+rbSec:Toggle({
+	Name = "Auto-Fire When Clear",
+	Flag = "op1_manipAutoFire",
+	Default = true,
+	Callback = function(v) S.manipAutoFire = v end
+})
 
 local visSec = PanelsSub:Section({ Name = "Visuals", Icon = "136879043989014", Side = 1 })
 visSec:Toggle({ Name = "Enemy Panel", Flag = "op1_enemyPanel", Default = true, Callback = function(v) S.enemyPanel = v; panelGui.Enabled = v end })
@@ -6538,125 +6590,88 @@ RunService:BindToRenderStep("OP1_ThirdPerson", Enum.RenderPriority.Camera.Value 
 track({ Disconnect = function() pcall(tpRestore); pcall(function() RunService:UnbindFromRenderStep("OP1_ThirdPerson") end) end })
 
 -- ===========================================================================
--- FEATURE: Peekbot (pre-peek visible test -> instant peek -> fire if vis/wb -> back)
+-- FEATURE: Origin Manipulation (smooth, no teleport, no viewmodel move)
+-- Temporarily forces the shoot origin to a position that has clear LOS
 -- ===========================================================================
-local function seeStatus(fromPos, head, ignore)
-	local params = RaycastParams.new(); params.FilterType = Enum.RaycastFilterType.Exclude; params.FilterDescendantsInstances = ignore
-	local last = fromPos
-	local layers = 0
-	for _ = 1, 12 do
-		local d = head.Position - last
-		if d.Magnitude < 0.3 then return layers == 0 and "vis" or "wb" end
-		local r = WS:Raycast(last, d, params)
-		if not r then return layers == 0 and "vis" or "wb" end
-		if r.Instance == head or r.Instance.Parent == head.Parent then return layers == 0 and "vis" or "wb" end
-		params:AddToFilter(r.Instance)
-		if not penetrable(r.Instance) then return nil end
-		layers = layers + 1
-		last = r.Position + d.Unit * 0.05
+
+local manipOrigin = nil
+local manipTargetPos = nil
+local lastManipFire = 0
+
+local function getManipOrigin(targetPos)
+	local cam = WS.CurrentCamera
+	if not cam or not targetPos then return nil end
+
+	local camPos = cam.CFrame.Position
+	local dir = (targetPos - camPos)
+	if dir.Magnitude < 1 then return nil end
+	dir = dir.Unit
+
+	local ignore = getIgnore()
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local offsets = {
+		dir,
+		(dir + cam.CFrame.RightVector * 0.35).Unit,
+		(dir - cam.CFrame.RightVector * 0.35).Unit,
+		(dir + cam.CFrame.RightVector * 0.7).Unit,
+		(dir - cam.CFrame.RightVector * 0.7).Unit,
+	}
+
+	for _, testDir in ipairs(offsets) do
+		local origin = camPos + testDir * 0.25
+		local result = WS:Raycast(origin, testDir * S.manipDist, params)
+
+		if not result then
+			return origin + testDir * (S.manipDist * 0.55)
+		end
+
+		local past = result.Position + testDir * 0.12
+		local check = WS:Raycast(past, (targetPos - past), params)
+		if not check or (check.Position - targetPos).Magnitude < 2.8 then
+			return past
+		end
 	end
+
 	return nil
 end
--- move the camera (shot origin) with the teleport, after the game's camera update
-RunService:BindToRenderStep("OP1_PeekCam", Enum.RenderPriority.Camera.Value + 1, function()
-	if peekState == "peek" and peekDelta and peekSavedCam then
-		local cam = WS.CurrentCamera
-		if cam then
-			local pos = peekSavedCam.Position + peekDelta
-			if peekAim then cam.CFrame = CFrame.lookAt(pos, peekAim) else cam.CFrame = peekSavedCam + peekDelta end
+
+track(RunService.RenderStepped:Connect(function()
+	manipOrigin = nil
+	manipTargetPos = nil
+
+	if not S.manip or not S.manipKeyHeld then return end
+
+	local targets = getTargets()
+	if #targets == 0 then return end
+
+	local best = targets[1]
+	local aimPos = best.aim and best.aim.Position or (best.e and best.e.head and best.e.head.Position)
+	if not aimPos then return end
+
+	local origin = getManipOrigin(aimPos)
+	if not origin then return end
+
+	manipOrigin = origin
+	manipTargetPos = aimPos
+
+	-- Publish to the silent aim actor so it can force the origin
+	WS:SetAttribute("__op1_manipOrigin", origin)
+	WS:SetAttribute("__op1_manipTarget", aimPos)
+	WS:SetAttribute("__op1_manipT", os.clock())
+
+	if S.manipAutoFire and (not Window or not Window.IsOpen) then
+		local now = os.clock()
+		if now - lastManipFire > 0.06 then
+			lastManipFire = now
+			pcall(function() mouse1press() end)
+			task.delay(0.02, function()
+				pcall(function() mouse1release() end)
+			end)
 		end
 	end
-end)
-track({ Disconnect = function() pcall(function() RunService:UnbindFromRenderStep("OP1_PeekCam") end) end })
-track(RunService.RenderStepped:Connect(function(dt)
-	if not S.peekbot then if peekState ~= "idle" then peekReset() end return end
-	local char = LP.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local root = char and char:FindFirstChild("HumanoidRootPart")
-	local cam = WS.CurrentCamera
-	if not hum or not root or not cam or hum.Health <= 0 then peekReset() return end
-	if not S.peekHeld then
-		if peekState ~= "idle" then peekReset() end
-		return
-	end
-	peekTimer = peekTimer + dt
-	if peekState == "idle" then
-		local md = hum.MoveDirection
-		local dir = md
-		if dir.Magnitude < 0.05 then
-			local look = cam.CFrame.LookVector
-			dir = Vector3.new(look.X, 0, look.Z)
-			if dir.Magnitude < 0.01 then dir = Vector3.new(0, 0, 1) end
-		end
-		peekState = "peek"; peekTimer = 0
-		peekSavedCF = root.CFrame
-		peekSavedCam = cam.CFrame
-		peekDelta = dir.Unit * S.peekStuds
-		peekAim = nil
-		pcall(function() root.Anchored = true end)
-	end
-    if peekState == "peek" then
-        pcall(function()
-            if not root.Anchored then
-                root.Anchored = true
-            end
-        end)
-
-        pcall(function()
-            root.CFrame = peekSavedCF + peekDelta
-        end)
-
-        local ignore = getIgnore()
-        local vis, wb, best = false, false, nil
-
-        for _, e in ipairs(getEnemies()) do
-            local st = seeStatus(peekSavedCam.Position + peekDelta, e.head, ignore)
-
-            if st == "vis" then
-                vis = true
-                best = e.head.Position
-                break
-            end
-
-            if st == "wb" and not best then
-                wb = true
-                best = e.head.Position
-            end
-        end
-
-        peekAim = vis and best or nil
-
-        local interval = math.max(0.01, S.peekMs / 1000)
-
-        if peekTimer >= interval then
-            peekTimer = 0
-
-            if S.peekAutoFire and (not Window or not Window.IsOpen) and (vis or wb) then
-                pcall(function()
-                    mouse1press()
-                end)
-
-                task.delay(0.02, function()
-                    pcall(function()
-                        mouse1release()
-                    end)
-                end)
-            end
-
-            -- Return and start another peek cycle
-            pcall(function()
-                root.CFrame = peekSavedCF
-                root.Anchored = false
-            end)
-
-            peekState = "idle"
-        end
-    else
-        -- Safety: if peek held but state is not peek, reset
-        if peekState ~= "idle" and peekState ~= "peek" then
-            peekReset()
-        end
-    end
 end))
 
 -- on respawn, clean up any stale third-person bodies
